@@ -1,0 +1,32 @@
+name: OECD Auto Update
+
+on:
+  schedule:
+    - cron: "0 12 * * *" # runs daily at 12:00 UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run auto update script
+        run: python oecd_pipeline/auto_update.py
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add data/
+          git commit -m "Auto-update OECD data" || echo "No changes"
+          git push
