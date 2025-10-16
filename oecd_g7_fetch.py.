@@ -1,0 +1,47 @@
+import requests
+import pandas as pd
+from pathlib import Path
+import json
+
+# OECD JSON API URL
+OECD_JSON_URL = "https://sdmx.oecd.org/public/sdmxapi/rest/data/QNA/Q..USA+CAN+JPN+GBR+DEU+FRA+ITA+AUS.B1_GE.CQRSA/all?startTime=2000-Q1&endTime=2025-Q3&contentType=json"
+PARQUET_FILE = Path("g7_gdp.parquet")
+
+# Fetch JSON
+resp = requests.get(OECD_JSON_URL, timeout=60)
+resp.raise_for_status()
+data = resp.json()
+Path("raw_oecd.json").write_text(json.dumps(data))  # Optional: save raw JSON
+
+# Parse JSON into DataFrame
+def parse_sdmx_json(data):
+    obs_dims = data.get("structure", {}).get("dimensions", {}).get("observation", [])
+    times = [v["id"] for v in obs_dims[0]["values"]] if obs_dims else []
+
+    series_dims = data.get("structure", {}).get("dimensions", {}).get("series", [])
+    series_values = [[v["id"] for v in sd.get("values", [])] for sd in series_dims]
+
+    series_block = data.get("dataSets", [{}])[0].get("series", {})
+    records = {}
+
+    for key, val in series_block.items():
+        parts = key.split(":")
+        colname = ".".join([series_values[i][int(p)] for i,p in enumerate(parts)])
+        obs = val.get("observations", {})
+        series_data = [None]*len(times)
+        for idx, v in obs.items():
+            series_data[int(idx)] = float(v[0]) if isinstance(v, list) else float(v)
+        records[colname] = series_data
+
+    df = pd.DataFrame(records, index=pd.Index(times, name="period"))
+    return df
+
+df = parse_sdmx_json(data)
+df.to_parquet(PARQUET_FILE)
+print("Saved OECD G7 GDP data to:", PARQUET_FILE)
+
+# Example query
+country = "CAN"
+period = "2022-Q1"
+cols = [c for c in df.columns if country in c]
+print(df.loc[df.index == period, cols])

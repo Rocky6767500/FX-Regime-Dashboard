@@ -1,0 +1,6 @@
+{
+  "output_dir": "data",
+  "series": {
+    "GDP_USA": "https://stats.oecd.org/restsdmx/sdmx.ashx/GetData/QNA/USA.B1_GE.CPCARSA.Q?contentType=xml"    "GDP_JPN": "https://stats.oecd.org/restsdmx/sdmx.ashx/GetData/QNA/JPN.B1_GE.CPCARSA.Q?contentType=xml"
+  }
+

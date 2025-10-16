@@ -1,0 +1,5 @@
+/usr/local/share/nvm/versions/node/v22.17.0/lib
+├── corepack@0.33.0
+├── npm@9.8.1
+└── pnpm@10.13.1
+

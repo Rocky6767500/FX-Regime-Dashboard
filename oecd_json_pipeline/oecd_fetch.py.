@@ -1,0 +1,187 @@
+# oecd_fetch.py
+import requests, json, sys, time
+from pathlib import Path
+import pandas as pd
+import xmltodict
+import pandasdmx
+from datetime import datetime
+
+# CONFIG - replace this with the dataset/filter you need
+JSON_URL = ("https://sdmx.oecd.org/public/sdmxapi/rest/data/"
+            "QNA/Q..USA+CAN+JPN+GBR+DEU+FRA+ITA+AUS.B1_GE.CQRSA/all"
+            "?startTime=2000-Q1&endTime=2025-Q3&contentType=json")
+XML_URL = JSON_URL.replace("/public/sdmxapi/rest/data/", "/public/rest/data/").replace("contentType=json", "")
+
+OUT_JSON_RAW = Path("raw_oecd.json")
+OUT_XML_RAW  = Path("raw_oecd.xml")
+OUT_PARQUET  = Path("oecd_data.parquet")
+
+HEADERS = {"User-Agent": "Rupesh-OECD-Client/1.0 (+https://example.com)"}
+REQUEST_TIMEOUT = 60
+RETRY = 3
+SLEEP_BETWEEN = 1.0
+
+def http_get(url, headers=None, timeout=REQUEST_TIMEOUT, retries=RETRY):
+    last_exc = None
+    for attempt in range(1, retries+1):
+        try:
+            r = requests.get(url, headers=(headers or HEADERS), timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            last_exc = e
+            # For 404 we should not retry many times
+            if r.status_code == 404:
+                raise
+            time.sleep(SLEEP_BETWEEN * attempt)
+        except Exception as e:
+            last_exc = e
+            time.sleep(SLEEP_BETWEEN * attempt)
+    raise last_exc
+
+def parse_sdmx_json_to_df(data):
+    # defensive extraction of times and series
+    struct = data.get("structure", {})
+    obs_dims = struct.get("dimensions", {}).get("observation", [])
+    times = [v["id"] for v in obs_dims[0]["values"]] if obs_dims else []
+    series_dims = struct.get("dimensions", {}).get("series", [])
+    series_values = [[v["id"] for v in sd.get("values", [])] for sd in series_dims]
+    series_block = data.get("dataSets", [{}])[0].get("series", {})
+    records = {}
+    for s_key, s_obj in series_block.items():
+        parts = s_key.split(":")
+        try:
+            col = ".".join(series_values[i][int(p)] for i,p in enumerate(parts))
+        except Exception:
+            col = s_key
+        obs = s_obj.get("observations", {})
+        vals = [None]*len(times)
+        for idx, v in obs.items():
+            pos = int(idx)
+            val = v[0] if isinstance(v, list) else v
+            try: val = float(val)
+            except: pass
+            if pos < len(vals):
+                vals[pos] = val
+            else:
+                while len(vals) <= pos:
+                    vals.append(None)
+                vals[pos] = val
+        records[col] = vals
+    if times:
+        df = pd.DataFrame(records, index=pd.Index(times, name="period"))
+    else:
+        df = pd.DataFrame(records)
+    return df
+
+def parse_xml_to_df(xml_text):
+    # naive conversion: xml -> dict -> flatten to records, then to df
+    d = xmltodict.parse(xml_text)
+    # Try to find series & obs in common SDMX generic structure
+    # This block is defensive because SDMX XML structures can vary
+    try:
+        series_list = d['GenericData']['DataSet']['Series']
+    except Exception:
+        # fallback for other xml shapes
+        # print sample structure to debug
+        raise RuntimeError("Unexpected SDMX-XML shape. Inspect raw XML.")
+    records = {}
+    times = set()
+    for s in series_list:
+        # build label from SeriesKey values
+        sk = s.get('SeriesKey', {}).get('Value', [])
+        if isinstance(sk, list):
+            label = ".".join([v.get('@value','') for v in sk])
+        else:
+            label = sk.get('@value','series')
+        obs_list = s.get('Obs', [])
+        if isinstance(obs_list, dict):
+            obs_list = [obs_list]
+        tmp = {}
+        for obs in obs_list:
+            time = obs.get('ObsDimension', {}).get('@value') or obs.get('Time', {}).get('#text')
+            value = obs.get('ObsValue', {}).get('@value') or obs.get('ObsValue', {}).get('#text')
+            if time is None:
+                continue
+            times.add(time)
+            try:
+                tmp[time] = float(value) if value is not None else None
+            except:
+                tmp[time] = value
+        records[label] = tmp
+    times = sorted(list(times))
+    # build table
+    df = pd.DataFrame({k: [records[k].get(t) for t in times] for k in records}, index=times)
+    df.index.name = "period"
+    return df
+
+def fetch_and_save():
+    # 1) Try JSON endpoint first
+    try:
+        print("Trying JSON URL...")
+        r = http_get(JSON_URL)
+        data = r.json()
+        OUT_JSON_RAW.write_text(json.dumps(data))
+        df = parse_sdmx_json_to_df(data)
+        df.to_parquet(OUT_PARQUET)
+        print("Saved parquet from JSON to", OUT_PARQUET)
+        return df
+    except requests.HTTPError as he:
+        print("JSON HTTP error:", he)
+        if getattr(he.response, "status_code", None) == 404:
+            print("JSON not available (404). Will try XML fallback.")
+        else:
+            print("HTTP error on JSON. Will try XML fallback.")
+    except Exception as e:
+        print("JSON fetch/parse error:", e, " — trying XML fallback.")
+
+    # 2) XML fallback
+    print("Fetching XML URL...")
+    r2 = http_get(XML_URL)
+    OUT_XML_RAW.write_text(r2.text)
+    df = parse_xml_to_df(r2.text)
+    df.to_parquet(OUT_PARQUET)
+    print("Saved parquet from XML to", OUT_PARQUET)
+    return df
+
+def info():
+    if not OUT_PARQUET.exists():
+        print("No parquet found. Run fetch first.")
+        return
+    df = pd.read_parquet(OUT_PARQUET)
+    print("Shape:", df.shape)
+    print("Sample columns:", df.columns[:30].tolist())
+    print("Sample periods:", df.index[:10].tolist())
+
+def query(country_code, period):
+    if not OUT_PARQUET.exists():
+        raise FileNotFoundError("Run fetch first.")
+    df = pd.read_parquet(OUT_PARQUET)
+    cols = [c for c in df.columns if country_code.upper() in c]
+    if not cols:
+        print("No columns matched country token. Sample columns:", df.columns[:30].tolist())
+        return
+    rows = df.loc[df.index == period]
+    if rows.empty:
+        rows = df.loc[[i for i in df.index if period in str(i)]]
+    if rows.empty:
+        print("No data found for period. Sample periods:", df.index[:10].tolist())
+        return
+    print(rows[cols].dropna(how='all'))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python oecd_fetch.py fetch|info|query <COUNTRY> <PERIOD>")
+        sys.exit(1)
+    cmd = sys.argv[1]
+    if cmd == "fetch":
+        fetch_and_save()
+    elif cmd == "info":
+        info()
+    elif cmd == "query":
+        if len(sys.argv) < 4:
+            print("Usage: python oecd_fetch.py query <COUNTRY> <PERIOD>")
+        else:
+            query(sys.argv[2], sys.argv[3])
+    else:
+        print("Unknown command")
